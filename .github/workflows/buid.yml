@@ -9,11 +9,11 @@ jobs:
       matrix:
         include:
           - os: windows-latest
-            output_name: Accountant Tools.exe
-            artifact_name: Accountant Tools-Windows
+            output_name: AccountantTools.exe
+            artifact_name: AccountantTools-Windows
           - os: macos-latest
-            output_name: Accountant Tools
-            artifact_name: Accountant Tools-Mac
+            output_name: AccountantTools
+            artifact_name: AccountantTools-Mac
 
     runs-on: ${{ matrix.os }}
 
@@ -33,7 +33,7 @@ jobs:
           pip install -r requirements.txt
 
       - name: Build executable
-        run: pyinstaller --onefile --windowed --name Accountant Tools depreciation_ui.py
+        run: pyinstaller --onefile --windowed --name AccountantTools depreciation_ui.py
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
