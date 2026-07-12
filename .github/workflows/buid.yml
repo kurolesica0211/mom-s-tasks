@@ -1,0 +1,43 @@
+name: Build Executables
+
+on:
+  workflow_dispatch:    # lets you trigger manually from the Actions tab
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - os: windows-latest
+            output_name: Accountant Tools.exe
+            artifact_name: Accountant Tools-Windows
+          - os: macos-latest
+            output_name: Accountant Tools
+            artifact_name: Accountant Tools-Mac
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pyinstaller
+          pip install -r requirements.txt
+
+      - name: Build executable
+        run: pyinstaller --onefile --windowed --name Accountant Tools depreciation_ui.py
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact_name }}
+          path: |
+            dist/${{ matrix.output_name }}
