@@ -1,11 +1,21 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from datetime import date
 from pathlib import Path
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
 from arenda_table import TaxRateRule, build_arenda_workbook, save_arenda_workbook
+from depreciation_table import (
+    MONTH_NAMES,
+    MONTH_TO_INDEX,
+    ContractInput,
+    Period,
+    generate_depreciation_workbook,
+    list_table_names,
+    save_depreciation_workbook,
+)
 
 
 @dataclass
@@ -18,6 +28,14 @@ class LessorInput:
 
 
 @dataclass
+class ContractFileInput:
+    frame: ttk.LabelFrame
+    file_label_var: tk.StringVar
+    number_var: tk.StringVar
+    file_path: Path | None = None
+
+
+@dataclass
 class TaxRuleInput:
     frame: ttk.Frame
     year_var: tk.StringVar
@@ -25,6 +43,10 @@ class TaxRuleInput:
 
 
 class ArendaUI:
+    SOURCE_EXISTING = "existing"
+    SOURCE_NEW_IN_FILE = "new_in_file"
+    SOURCE_NEW_FILE = "new_file"
+
     def __init__(self, root: tk.Tk):
         self.root = root
         self.root.title("Генератор таблиц")
@@ -35,6 +57,22 @@ class ArendaUI:
 
         self.lessor_items: list[LessorInput] = []
         self.tax_rule_items: list[TaxRuleInput] = []
+
+        self.source_mode_var = tk.StringVar(value=self.SOURCE_EXISTING)
+        self.table_file: Path | None = None
+        self.table_file_var = tk.StringVar(value="Файл не выбран")
+        self.table_name_var = tk.StringVar()
+        self.new_table_name_var = tk.StringVar()
+        self.detected_table_names: list[str] = []
+
+        self.statement_file: Path | None = None
+        self.statement_file_var = tk.StringVar(value="Файл не выбран")
+
+        today = date.today()
+        self.month_var = tk.StringVar(value=MONTH_NAMES[today.month - 1].capitalize())
+        self.year_var = tk.StringVar(value=str(today.year))
+
+        self.contract_items: list[ContractFileInput] = []
 
         self.main = ttk.Frame(self.root, padding=16)
         self.main.pack(fill="both", expand=True)
@@ -56,7 +94,7 @@ class ArendaUI:
             task_row,
             textvariable=self.task_var,
             state="readonly",
-            values=["Аренда"],
+            values=["Аренда", "Амортизация"],
         )
         task_combo.grid(row=0, column=1, sticky="ew")
         task_combo.bind("<<ComboboxSelected>>", self._on_task_changed)
@@ -86,6 +124,9 @@ class ArendaUI:
         self.arenda_panel = ttk.Frame(self.task_container)
         self._build_arenda_panel(self.arenda_panel)
 
+        self.amortization_panel = ttk.Frame(self.task_container)
+        self._build_amortization_panel(self.amortization_panel)
+
     def _refresh_task_scrollregion(self, _event: tk.Event | None = None) -> None:
         self.task_canvas.configure(scrollregion=self.task_canvas.bbox("all"))
 
@@ -104,7 +145,7 @@ class ArendaUI:
         return self._widget_inside_task_area(widget)
 
     def _on_task_mousewheel(self, event: tk.Event) -> None:
-        if not self._pointer_inside_task_area() or self._pointer_inside_lessor_list():
+        if not self._pointer_inside_task_area() or self._pointer_inside_lessor_list() or self._pointer_inside_contracts_list():
             return
 
         delta = getattr(event, "delta", 0)
@@ -120,7 +161,7 @@ class ArendaUI:
             self.task_canvas.yview_scroll(units, "units")
 
     def _on_task_mousewheel_linux(self, event: tk.Event) -> None:
-        if not self._pointer_inside_task_area() or self._pointer_inside_lessor_list():
+        if not self._pointer_inside_task_area() or self._pointer_inside_lessor_list() or self._pointer_inside_contracts_list():
             return
 
         button = getattr(event, "num", None)
@@ -200,6 +241,10 @@ class ArendaUI:
 
         if self.task_var.get() == "Аренда":
             self.arenda_panel.grid(row=0, column=0, sticky="nsew")
+            self.task_container.rowconfigure(0, weight=1)
+            self.task_container.columnconfigure(0, weight=1)
+        elif self.task_var.get() == "Амортизация":
+            self.amortization_panel.grid(row=0, column=0, sticky="nsew")
             self.task_container.rowconfigure(0, weight=1)
             self.task_container.columnconfigure(0, weight=1)
 
@@ -412,6 +457,358 @@ class ArendaUI:
             )
             save_arenda_workbook(workbook, output_path)
             messagebox.showinfo("Готово", f"Файл сохранен:\n{output_path}")
+        except Exception as exc:
+            messagebox.showerror("Ошибка", str(exc))
+
+    def _build_amortization_panel(self, parent: ttk.Frame) -> None:
+        parent.columnconfigure(0, weight=1)
+
+        source_box = ttk.LabelFrame(parent, text="Итоговая таблица Амортизации", padding=10)
+        source_box.grid(row=0, column=0, sticky="ew")
+        source_box.columnconfigure(0, weight=1)
+
+        ttk.Radiobutton(
+            source_box,
+            text="Дополнить существующую таблицу новым месяцем/договором",
+            variable=self.source_mode_var,
+            value=self.SOURCE_EXISTING,
+            command=self._on_source_mode_changed,
+        ).grid(row=0, column=0, sticky="w")
+        ttk.Radiobutton(
+            source_box,
+            text="Создать новую таблицу в загруженном файле",
+            variable=self.source_mode_var,
+            value=self.SOURCE_NEW_IN_FILE,
+            command=self._on_source_mode_changed,
+        ).grid(row=1, column=0, sticky="w")
+        ttk.Radiobutton(
+            source_box,
+            text="Создать новую таблицу в новом файле",
+            variable=self.source_mode_var,
+            value=self.SOURCE_NEW_FILE,
+            command=self._on_source_mode_changed,
+        ).grid(row=2, column=0, sticky="w")
+
+        self.table_file_row = ttk.Frame(source_box)
+        self.table_file_row.grid(row=3, column=0, sticky="ew", pady=(10, 0))
+        self.table_file_row.columnconfigure(1, weight=1)
+        ttk.Button(self.table_file_row, text="Выбрать файл таблицы", command=self._choose_table_file).grid(row=0, column=0, sticky="w")
+        ttk.Label(self.table_file_row, textvariable=self.table_file_var, justify="left").grid(row=0, column=1, sticky="ew", padx=(8, 0))
+
+        self.table_name_row = ttk.Frame(source_box)
+        self.table_name_row.grid(row=4, column=0, sticky="ew", pady=(8, 0))
+        ttk.Label(self.table_name_row, text="Название таблицы").grid(row=0, column=0, sticky="w", padx=(0, 8))
+        self.table_name_combo = ttk.Combobox(self.table_name_row, textvariable=self.table_name_var, width=30)
+        self.table_name_combo.grid(row=0, column=1, sticky="w")
+
+        self.new_table_row = ttk.Frame(source_box)
+        self.new_table_row.grid(row=5, column=0, sticky="ew", pady=(8, 0))
+        ttk.Label(self.new_table_row, text="Название новой таблицы").grid(row=0, column=0, sticky="w", padx=(0, 8))
+        ttk.Entry(self.new_table_row, textvariable=self.new_table_name_var, width=32).grid(row=0, column=1, sticky="w")
+
+        statement_box = ttk.LabelFrame(parent, text="Ведомость Амортизации", padding=10)
+        statement_box.grid(row=1, column=0, sticky="ew", pady=(12, 0))
+        statement_box.columnconfigure(1, weight=1)
+        ttk.Button(statement_box, text="Выбрать файл", command=self._choose_statement_file).grid(row=0, column=0, sticky="w")
+        ttk.Label(statement_box, textvariable=self.statement_file_var, justify="left").grid(row=0, column=1, sticky="ew", padx=(8, 0))
+
+        contracts_box = ttk.LabelFrame(parent, text="Договоры Аренды", padding=10)
+        contracts_box.grid(row=2, column=0, sticky="ew", pady=(12, 0))
+        contracts_box.columnconfigure(0, weight=1)
+
+        contracts_actions = ttk.Frame(contracts_box)
+        contracts_actions.grid(row=0, column=0, sticky="ew")
+        ttk.Button(contracts_actions, text="Добавить договор", command=self._add_contract).pack(side="left")
+
+        list_frame = ttk.Frame(contracts_box)
+        list_frame.grid(row=1, column=0, sticky="ew", pady=(10, 0))
+        list_frame.columnconfigure(0, weight=1)
+
+        self.contracts_canvas = tk.Canvas(list_frame, height=220, borderwidth=0, highlightthickness=0)
+        self.contracts_canvas.grid(row=0, column=0, sticky="ew")
+
+        self.contracts_scrollbar = ttk.Scrollbar(list_frame, orient="vertical", command=self.contracts_canvas.yview)
+        self.contracts_scrollbar.grid(row=0, column=1, sticky="ns")
+        self.contracts_canvas.configure(yscrollcommand=self.contracts_scrollbar.set)
+
+        self.contracts_body = ttk.Frame(self.contracts_canvas)
+        self.contracts_body.columnconfigure(0, weight=1)
+        self.contracts_canvas_window = self.contracts_canvas.create_window((0, 0), window=self.contracts_body, anchor="nw")
+        self.contracts_body.bind("<Configure>", self._refresh_contracts_scrollregion)
+        self.contracts_canvas.bind("<Configure>", self._resize_contracts_body_to_canvas)
+        self.root.bind_all("<MouseWheel>", self._on_contracts_mousewheel, add="+")
+        self.root.bind_all("<Button-4>", self._on_contracts_mousewheel_linux, add="+")
+        self.root.bind_all("<Button-5>", self._on_contracts_mousewheel_linux, add="+")
+
+        ttk.Label(
+            parent,
+            text=(
+                "Ведомость Амортизации и все файлы Договоров Аренды должны относиться "
+                "к одному и тому же месяцу и году - тому, что выбран ниже."
+            ),
+            foreground="#4a4a4a",
+            wraplength=820,
+            justify="left",
+        ).grid(row=3, column=0, sticky="ew", pady=(12, 0))
+
+        period_box = ttk.LabelFrame(parent, text="Период", padding=10)
+        period_box.grid(row=4, column=0, sticky="ew", pady=(12, 0))
+        ttk.Label(period_box, text="Месяц").grid(row=0, column=0, sticky="w", padx=(0, 8))
+        month_combo = ttk.Combobox(
+            period_box,
+            textvariable=self.month_var,
+            state="readonly",
+            values=[name.capitalize() for name in MONTH_NAMES],
+            width=14,
+        )
+        month_combo.grid(row=0, column=1, sticky="w")
+        ttk.Label(period_box, text="Год").grid(row=0, column=2, sticky="w", padx=(16, 8))
+        ttk.Entry(period_box, textvariable=self.year_var, width=8).grid(row=0, column=3, sticky="w")
+
+        actions = ttk.Frame(parent)
+        actions.grid(row=5, column=0, sticky="ew", pady=(16, 0))
+        actions.columnconfigure(0, weight=1)
+        ttk.Button(actions, text="Сформировать", command=self._generate_amortization).grid(row=0, column=1, sticky="e")
+
+        self._on_source_mode_changed()
+        self._add_contract()
+
+    def _on_source_mode_changed(self, _event: tk.Event | None = None) -> None:
+        mode = self.source_mode_var.get()
+        show_file = mode in (self.SOURCE_EXISTING, self.SOURCE_NEW_IN_FILE)
+        show_new_name = mode in (self.SOURCE_NEW_IN_FILE, self.SOURCE_NEW_FILE)
+
+        if show_file:
+            self.table_file_row.grid()
+        else:
+            self.table_file_row.grid_remove()
+            self.table_file = None
+            self.table_file_var.set("Файл не выбран")
+            self.detected_table_names = []
+
+        if show_new_name:
+            self.new_table_row.grid()
+        else:
+            self.new_table_row.grid_remove()
+
+        self._refresh_table_name_visibility()
+
+    def _refresh_table_name_visibility(self) -> None:
+        show = self.source_mode_var.get() == self.SOURCE_EXISTING and len(self.detected_table_names) > 1
+        if show:
+            self.table_name_combo["values"] = self.detected_table_names
+            self.table_name_row.grid()
+        else:
+            self.table_name_row.grid_remove()
+
+    def _choose_table_file(self) -> None:
+        chosen = filedialog.askopenfilename(
+            title="Выберите файл итоговой таблицы Амортизации",
+            filetypes=[("Excel", "*.xlsx"), ("All files", "*.*")],
+        )
+        if not chosen:
+            return
+
+        path = Path(chosen)
+        if path.suffix.lower() != ".xlsx":
+            messagebox.showerror("Ошибка", "Файл итоговой таблицы должен быть в формате .xlsx.")
+            return
+
+        self.table_file = path
+        self.table_file_var.set(str(path))
+        try:
+            self.detected_table_names = list_table_names(path)
+        except Exception as exc:
+            messagebox.showerror("Ошибка", f"Не удалось прочитать файл:\n{exc}")
+            self.detected_table_names = []
+
+        if len(self.detected_table_names) == 1:
+            self.table_name_var.set(self.detected_table_names[0])
+        else:
+            self.table_name_var.set("")
+
+        self._refresh_table_name_visibility()
+
+    def _choose_statement_file(self) -> None:
+        chosen = filedialog.askopenfilename(
+            title="Выберите файл Ведомости Амортизации",
+            filetypes=[("Excel", "*.xlsx *.xls"), ("All files", "*.*")],
+        )
+        if chosen:
+            self.statement_file = Path(chosen)
+            self.statement_file_var.set(str(self.statement_file))
+
+    def _refresh_contracts_scrollregion(self, _event: tk.Event | None = None) -> None:
+        self.contracts_canvas.configure(scrollregion=self.contracts_canvas.bbox("all"))
+
+    def _resize_contracts_body_to_canvas(self, event: tk.Event) -> None:
+        self.contracts_canvas.itemconfigure(self.contracts_canvas_window, width=event.width)
+
+    def _widget_inside_contracts_list(self, widget: tk.Misc | None) -> bool:
+        while widget is not None:
+            if widget is self.contracts_canvas or widget is self.contracts_body:
+                return True
+            widget = widget.master
+        return False
+
+    def _pointer_inside_contracts_list(self) -> bool:
+        widget = self.root.winfo_containing(self.root.winfo_pointerx(), self.root.winfo_pointery())
+        return self._widget_inside_contracts_list(widget)
+
+    def _on_contracts_mousewheel(self, event: tk.Event) -> None:
+        if not self._pointer_inside_contracts_list():
+            return
+
+        delta = getattr(event, "delta", 0)
+        if not delta:
+            return
+
+        if abs(delta) < 120:
+            units = -1 if delta > 0 else 1
+        else:
+            units = int(-delta / 120)
+
+        if units:
+            self.contracts_canvas.yview_scroll(units, "units")
+
+    def _on_contracts_mousewheel_linux(self, event: tk.Event) -> None:
+        if not self._pointer_inside_contracts_list():
+            return
+
+        button = getattr(event, "num", None)
+        if button == 4:
+            self.contracts_canvas.yview_scroll(-1, "units")
+        elif button == 5:
+            self.contracts_canvas.yview_scroll(1, "units")
+
+    def _add_contract(self) -> None:
+        idx = len(self.contract_items) + 1
+        wrapper = ttk.LabelFrame(self.contracts_body, text=f"Договор {idx}", padding=8)
+        wrapper.grid(row=len(self.contract_items), column=0, sticky="ew", pady=(0, 8))
+        wrapper.columnconfigure(1, weight=1)
+
+        file_var = tk.StringVar(value="Файл не выбран")
+        ttk.Label(wrapper, textvariable=file_var, justify="left").grid(row=0, column=0, columnspan=2, sticky="w")
+
+        ttk.Label(wrapper, text="Номер договора").grid(row=1, column=0, sticky="w", padx=(0, 8), pady=(6, 0))
+        number_var = tk.StringVar()
+        ttk.Entry(wrapper, textvariable=number_var).grid(row=1, column=1, sticky="ew", pady=(6, 0))
+
+        item = ContractFileInput(frame=wrapper, file_label_var=file_var, number_var=number_var)
+        self.contract_items.append(item)
+
+        actions = ttk.Frame(wrapper)
+        actions.grid(row=2, column=0, columnspan=2, sticky="w", pady=(6, 0))
+        ttk.Button(actions, text="Выбрать файл", command=lambda target=item: self._choose_contract_file(target)).pack(side="left")
+        ttk.Button(actions, text="Удалить", command=lambda target=item: self._remove_contract(target)).pack(side="left", padx=(8, 0))
+
+        self._refresh_contracts_scrollregion()
+
+    def _choose_contract_file(self, item: ContractFileInput) -> None:
+        chosen = filedialog.askopenfilename(
+            title="Выберите файл договора аренды",
+            filetypes=[("Excel", "*.xlsx *.xls"), ("All files", "*.*")],
+        )
+        if chosen:
+            item.file_path = Path(chosen)
+            item.file_label_var.set(str(item.file_path))
+
+    def _remove_contract(self, item: ContractFileInput) -> None:
+        if len(self.contract_items) == 1:
+            messagebox.showwarning("Нельзя удалить", "Должен остаться хотя бы один договор.")
+            return
+
+        item.frame.destroy()
+        self.contract_items = [entry for entry in self.contract_items if entry is not item]
+
+        for idx, entry in enumerate(self.contract_items, start=1):
+            entry.frame.configure(text=f"Договор {idx}")
+            entry.frame.grid_configure(row=idx - 1)
+
+        self._refresh_contracts_scrollregion()
+
+    def _collect_contracts(self) -> list[ContractInput]:
+        contracts: list[ContractInput] = []
+        seen_numbers: set[str] = set()
+        for item in self.contract_items:
+            number = item.number_var.get().strip()
+            if item.file_path is None and not number:
+                continue
+            if item.file_path is None:
+                raise ValueError("У каждого договора должен быть выбран файл.")
+            if not number:
+                raise ValueError("У каждого договора должен быть указан номер.")
+            if number in seen_numbers:
+                raise ValueError(f"Номер договора '{number}' указан более одного раза.")
+            seen_numbers.add(number)
+            contracts.append(ContractInput(contract_number=number, contract_file=item.file_path))
+
+        if not contracts:
+            raise ValueError("Добавьте хотя бы один договор аренды.")
+
+        return contracts
+
+    def _generate_amortization(self) -> None:
+        try:
+            month_text = self.month_var.get().strip().lower()
+            if month_text not in MONTH_TO_INDEX:
+                raise ValueError("Выберите месяц периода.")
+
+            year_text = self.year_var.get().strip()
+            if not year_text.isdigit():
+                raise ValueError("Укажите год периода числом.")
+
+            period = Period(year=int(year_text), month_index=MONTH_TO_INDEX[month_text])
+
+            if not self.statement_file:
+                raise ValueError("Выберите файл 'Ведомость Амортизации'.")
+
+            contracts = self._collect_contracts()
+
+            mode = self.source_mode_var.get()
+            source_table_path: Path | None = None
+            source_table_name: str | None = None
+            new_table_name: str | None = None
+
+            if mode == self.SOURCE_EXISTING:
+                if not self.table_file:
+                    raise ValueError("Выберите файл итоговой таблицы Амортизации.")
+                source_table_path = self.table_file
+                source_table_name = self.table_name_var.get().strip()
+                if not source_table_name:
+                    raise ValueError("Укажите название таблицы, которую нужно дополнить.")
+            elif mode == self.SOURCE_NEW_IN_FILE:
+                if not self.table_file:
+                    raise ValueError("Выберите файл, в который нужно добавить новую таблицу.")
+                source_table_path = self.table_file
+                new_table_name = self.new_table_name_var.get().strip()
+                if not new_table_name:
+                    raise ValueError("Укажите название новой таблицы.")
+            else:
+                new_table_name = self.new_table_name_var.get().strip()
+                if not new_table_name:
+                    raise ValueError("Укажите название новой таблицы.")
+
+            result = generate_depreciation_workbook(
+                period=period,
+                statement_file=self.statement_file,
+                contracts=contracts,
+                source_table_path=source_table_path,
+                source_table_name=source_table_name,
+                new_table_name=new_table_name,
+            )
+
+            output_path = filedialog.asksaveasfilename(
+                title="Куда сохранить файл",
+                defaultextension=".xlsx",
+                filetypes=[("Excel", "*.xlsx")],
+                initialfile="Амортизация.xlsx",
+            )
+            if not output_path:
+                return
+
+            save_depreciation_workbook(result, output_path)
+            messagebox.showinfo("Готово", "Файл сохранен:\n{}\n\n{}".format(output_path, "\n".join(result.messages)))
         except Exception as exc:
             messagebox.showerror("Ошибка", str(exc))
 
