@@ -11,6 +11,7 @@ from depreciation_table import (
     MONTH_NAMES,
     MONTH_TO_INDEX,
     ContractInput,
+    GenerationResult,
     Period,
     generate_depreciation_workbook,
     list_table_names,
@@ -77,8 +78,29 @@ class ArendaUI:
         self.main = ttk.Frame(self.root, padding=16)
         self.main.pack(fill="both", expand=True)
 
+        self._bind_edit_shortcuts()
         self._build_header()
         self._build_task_container()
+
+    def _bind_edit_shortcuts(self) -> None:
+        # Without a native menu bar, macOS can fail to route Cmd+C/V/X/A to the focused
+        # widget (this is especially common once the app is bundled as a standalone .app),
+        # so bind them explicitly instead of relying on Tk's default platform bindings.
+        def make_handler(virtual_event: str):
+            def handler(event: tk.Event) -> None:
+                event.widget.event_generate(virtual_event)
+            return handler
+
+        bindings = {
+            "<<Copy>>": ("<Command-c>", "<Control-c>"),
+            "<<Cut>>": ("<Command-x>", "<Control-x>"),
+            "<<Paste>>": ("<Command-v>", "<Control-v>"),
+            "<<SelectAll>>": ("<Command-a>", "<Control-a>"),
+        }
+        for virtual_event, sequences in bindings.items():
+            callback = make_handler(virtual_event)
+            for sequence in sequences:
+                self.root.bind_all(sequence, callback)
 
     def _build_header(self) -> None:
         header = ttk.Label(self.main, text="Инструменты бухгалтера", font=("Helvetica", 16, "bold"))
@@ -808,9 +830,70 @@ class ArendaUI:
                 return
 
             save_depreciation_workbook(result, output_path)
-            messagebox.showinfo("Готово", "Файл сохранен:\n{}\n\n{}".format(output_path, "\n".join(result.messages)))
+            self._show_report_dialog("Результат", self._build_report_text(output_path, result))
         except Exception as exc:
             messagebox.showerror("Ошибка", str(exc))
+
+    def _build_report_text(self, output_path: str, result: GenerationResult) -> str:
+        lines: list[str] = [f"Файл сохранен:\n{output_path}", ""]
+        lines.extend(result.messages)
+
+        if result.contract_errors:
+            lines.append("")
+            lines.append(f"ДОГОВОРЫ, КОТОРЫЕ НЕ УДАЛОСЬ ОБРАБОТАТЬ ({len(result.contract_errors)}):")
+            for error in result.contract_errors:
+                lines.append(f"- {error}")
+
+        if result.asset_failures:
+            lines.append("")
+            lines.append(f"НЕСОПОСТАВЛЕННЫЕ АКТИВЫ ({len(result.asset_failures)}):")
+            for failure in result.asset_failures:
+                lines.append(
+                    f"- Договор '{failure.contract_number}', {failure.asset_label} "
+                    f"(идентификатор: {failure.identifier_value}): {failure.reason}"
+                )
+
+        if not result.contract_errors and not result.asset_failures:
+            lines.append("")
+            lines.append("Проблем не обнаружено — все активы сопоставлены успешно.")
+
+        return "\n".join(lines)
+
+    def _show_report_dialog(self, title: str, text: str) -> None:
+        dialog = tk.Toplevel(self.root)
+        dialog.title(title)
+        dialog.geometry("900x600")
+        dialog.columnconfigure(0, weight=1)
+        dialog.rowconfigure(0, weight=1)
+
+        frame = ttk.Frame(dialog, padding=10)
+        frame.grid(row=0, column=0, sticky="nsew")
+        frame.columnconfigure(0, weight=1)
+        frame.rowconfigure(0, weight=1)
+
+        text_widget = tk.Text(frame, wrap="word", font=("Helvetica", 11))
+        text_widget.grid(row=0, column=0, sticky="nsew")
+
+        scrollbar = ttk.Scrollbar(frame, orient="vertical", command=text_widget.yview)
+        scrollbar.grid(row=0, column=1, sticky="ns")
+        text_widget.configure(yscrollcommand=scrollbar.set)
+
+        text_widget.insert("1.0", text)
+        text_widget.configure(state="disabled")
+
+        actions = ttk.Frame(frame)
+        actions.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+        actions.columnconfigure(0, weight=1)
+
+        def copy_to_clipboard() -> None:
+            self.root.clipboard_clear()
+            self.root.clipboard_append(text)
+
+        ttk.Button(actions, text="Копировать", command=copy_to_clipboard).grid(row=0, column=1, sticky="e", padx=(0, 8))
+        ttk.Button(actions, text="Закрыть", command=dialog.destroy).grid(row=0, column=2, sticky="e")
+
+        dialog.transient(self.root)
+        dialog.grab_set()
 
 
 def create_root() -> tk.Tk:

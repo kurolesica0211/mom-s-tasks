@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterable, Sequence
@@ -8,6 +9,11 @@ import openpyxl
 from openpyxl.styles import Border, Font, Side
 from openpyxl.utils import get_column_letter
 from openpyxl.worksheet.worksheet import Worksheet
+
+try:
+    import xlrd
+except ImportError:  # pragma: no cover - .xls support is optional at import time
+    xlrd = None
 
 
 MONTH_NAMES = [
@@ -56,8 +62,35 @@ def _tax_multiplier_for_year(year: int, tax_rules: Sequence[TaxRateRule] = DEFAU
 def _normalize_text(value: object) -> str:
     if value is None:
         return ""
+    if isinstance(value, float) and value.is_integer():
+        value = int(value)
     text = str(value).replace("\xa0", " ").strip()
     return " ".join(text.split())
+
+
+def _coerce_number(value: object) -> float | None:
+    if value in (None, ""):
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+
+    text = _normalize_text(value)
+    if not text:
+        return None
+
+    text = text.replace(" ", "")
+    if "," in text and "." in text:
+        if text.rfind(",") > text.rfind("."):
+            text = text.replace(".", "").replace(",", ".")
+        else:
+            text = text.replace(",", "")
+    else:
+        text = text.replace(",", ".")
+
+    try:
+        return float(text)
+    except ValueError:
+        return None
 
 
 @dataclass(frozen=True)
@@ -111,6 +144,8 @@ class GenerationResult:
     workbook: openpyxl.Workbook
     sheet_name: str
     messages: list[str]
+    contract_errors: list[str]
+    asset_failures: list[AssetFailure]
 
 
 def _safe_sheet_title(name: str) -> str:
@@ -230,19 +265,363 @@ def apply_contract_period_value(
     )
 
 
-def find_contract_depreciation_total(
+# Values meaning "no identifier available" - a literal dash, or the word "отсутствует"
+# ("not available") that some contract registries use instead. Compared case-insensitively.
+BLANK_IDENTIFIER_VALUES = {"-", "—", "–", "отсутствует"}
+
+# Cyrillic letters that are visually identical to a Latin letter or digit - the same set
+# used on Russian vehicle plates, plus З/3 which shows up interchangeably in VIN-like codes.
+# Identifiers (VIN, serial, inventory number) get folded onto this common alphabet before
+# comparison so 'ХЗW65392АН0001788' and 'X3W65392AH0001788' are recognized as the same value.
+_CYRILLIC_LOOKALIKE_TRANSLATION = str.maketrans({
+    "а": "a", "в": "b", "е": "e", "з": "3", "к": "k", "м": "m",
+    "н": "h", "о": "o", "р": "p", "с": "c", "т": "t", "у": "y", "х": "x",
+})
+
+
+def _normalize_identifier(text: str) -> str:
+    return text.casefold().translate(_CYRILLIC_LOOKALIKE_TRANSLATION)
+
+
+@dataclass(frozen=True)
+class AssetFailure:
+    contract_number: str
+    asset_label: str
+    identifier_value: str
+    reason: str
+
+
+@dataclass(frozen=True)
+class ContractMatchResult:
+    contract_number: str
+    total: float | None
+    matched_count: int
+    failures: list[AssetFailure]
+    contract_error: str | None = None
+
+
+def _load_generic_rows(path: str | Path) -> list[list[object]]:
+    file_path = Path(path)
+    suffix = file_path.suffix.lower()
+
+    if suffix == ".xlsx":
+        workbook = openpyxl.load_workbook(file_path, data_only=True)
+        sheet = workbook[workbook.sheetnames[0]]
+        return [list(row) for row in sheet.iter_rows(values_only=True)]
+
+    if suffix == ".xls":
+        if xlrd is None:
+            raise RuntimeError("xlrd is required to read .xls files")
+        workbook = xlrd.open_workbook(file_path)
+        sheet = workbook.sheet_by_index(0)
+        return [sheet.row_values(row_index) for row_index in range(sheet.nrows)]
+
+    raise ValueError(f"Unsupported workbook format: {file_path.suffix}")
+
+
+def _match_inventory_number_header(text: str) -> bool:
+    normalized = re.sub(r"[\s.]+", "", text.lower())
+    if not normalized.startswith("инв"):
+        return False
+    return "№" in normalized or "номер" in normalized or normalized.endswith("n")
+
+
+def _match_vin_header(text: str) -> bool:
+    normalized = re.sub(r"\s+", "", text.lower())
+    if "vin" in normalized:
+        return True
+    return "идентификацион" in normalized and "номер" in normalized
+
+
+def _match_factory_number_header(text: str) -> bool:
+    normalized = re.sub(r"[\s.]+", "", text.lower())
+    if not normalized.startswith("заводск"):
+        return False
+    return "№" in normalized or "номер" in normalized
+
+
+def _match_name_header(text: str) -> bool:
+    normalized = re.sub(r"\s+", "", text.lower())
+    return normalized.startswith("наименован")
+
+
+def _match_vedomost_inventory_header(text: str) -> bool:
+    normalized = re.sub(r"\s+", "", text.lower())
+    return "инвентарн" in normalized and "номер" in normalized
+
+
+def _match_vedomost_charge_header(text: str) -> bool:
+    normalized = text.lower()
+    return "начисл" in normalized and "амортиз" in normalized
+
+
+@dataclass(frozen=True)
+class _ContractIdentifierColumn:
+    row: int
+    column: int
+    rule: str  # "inventory" or "search_all"
+
+
+def _find_contract_identifier_column(rows: Sequence[Sequence[object]]) -> _ContractIdentifierColumn | None:
+    inventory_hit: tuple[int, int] | None = None
+    vin_hit: tuple[int, int] | None = None
+    factory_hit: tuple[int, int] | None = None
+
+    for row_index, row in enumerate(rows):
+        for column_index, value in enumerate(row):
+            text = _normalize_text(value)
+            if not text:
+                continue
+            if inventory_hit is None and _match_inventory_number_header(text):
+                inventory_hit = (row_index, column_index)
+            elif vin_hit is None and _match_vin_header(text):
+                vin_hit = (row_index, column_index)
+            elif factory_hit is None and _match_factory_number_header(text):
+                factory_hit = (row_index, column_index)
+
+    if inventory_hit is not None:
+        return _ContractIdentifierColumn(row=inventory_hit[0], column=inventory_hit[1], rule="inventory")
+    if vin_hit is not None:
+        return _ContractIdentifierColumn(row=vin_hit[0], column=vin_hit[1], rule="search_all")
+    if factory_hit is not None:
+        return _ContractIdentifierColumn(row=factory_hit[0], column=factory_hit[1], rule="search_all")
+    return None
+
+
+def _find_vedomost_columns(rows: Sequence[Sequence[object]]) -> tuple[int, int, int | None] | None:
+    """Returns (header_row, charge_column, inventory_column_or_None)."""
+    for row_index, row in enumerate(rows):
+        charge_column: int | None = None
+        inventory_column: int | None = None
+        for column_index, value in enumerate(row):
+            text = _normalize_text(value)
+            if not text:
+                continue
+            if _match_vedomost_charge_header(text):
+                charge_column = column_index
+            elif _match_vedomost_inventory_header(text):
+                inventory_column = column_index
+        if charge_column is not None:
+            return row_index, charge_column, inventory_column
+    return None
+
+
+def _row_is_total_marker(row: Sequence[object]) -> bool:
+    first_text = next((_normalize_text(value) for value in row if _normalize_text(value)), "")
+    return first_text.casefold().startswith("итого")
+
+
+def _match_by_inventory_number(identifier: str, statement_rows: Sequence[Sequence[object]], inventory_column: int, start_row: int) -> list[int]:
+    target = _normalize_identifier(identifier)
+    matches: list[int] = []
+    for row_index in range(start_row, len(statement_rows)):
+        row = statement_rows[row_index]
+        if _row_is_total_marker(row):
+            break
+        if inventory_column >= len(row):
+            continue
+        cell_text = _normalize_identifier(_normalize_text(row[inventory_column]))
+        if cell_text and cell_text == target:
+            matches.append(row_index)
+    return matches
+
+
+def _match_by_substring(identifier: str, statement_rows: Sequence[Sequence[object]], start_row: int) -> list[int]:
+    target = _normalize_identifier(identifier)
+    matches: list[int] = []
+    for row_index in range(start_row, len(statement_rows)):
+        row = statement_rows[row_index]
+        if _row_is_total_marker(row):
+            break
+        for value in row:
+            cell_text = _normalize_identifier(_normalize_text(value))
+            if cell_text and target in cell_text:
+                matches.append(row_index)
+                break
+    return matches
+
+
+def match_contract_depreciation(
+    contract_number: str,
     contract_file: str | Path,
     statement_file: str | Path,
-    period: Period,
-) -> float | None:
-    """Find the assets rented under `contract_file` inside `statement_file` for `period`
-    and sum their "Начисление амортизации (износа)" / "За период" values.
+) -> ContractMatchResult:
+    """Find the assets rented under `contract_file` inside `statement_file` and sum their
+    "Начисление амортизации (износа)" / "За период" values.
 
-    Not implemented yet - matching assets listed in a contract registry against rows of
-    the Ведомость Амортизации is the next milestone. Returning None leaves the
-    corresponding cell blank instead of writing a wrong number.
+    Matching rules, applied in order:
+      1. If the contract registry has an "Инв. №"-like column, match its values against the
+         "Инвентарный номер" column of the Ведомость (exact match).
+      2. Otherwise, if it has an "Идентификационный номер (VIN)" or "Заводской №"-like
+         column, search its values as a substring across every column of the Ведомость.
+    Assets with a blank/dash identifier, no match, or an ambiguous (multi-row) match are
+    reported as per-asset failures instead of silently affecting the total.
     """
-    return None
+    contract_file_name = Path(contract_file).name
+    statement_file_name = Path(statement_file).name
+
+    try:
+        contract_rows = _load_generic_rows(contract_file)
+    except Exception as exc:
+        return ContractMatchResult(
+            contract_number=contract_number,
+            total=None,
+            matched_count=0,
+            failures=[],
+            contract_error=f"Не удалось прочитать файл договора '{contract_file_name}': {exc}",
+        )
+
+    id_info = _find_contract_identifier_column(contract_rows)
+    if id_info is None:
+        return ContractMatchResult(
+            contract_number=contract_number,
+            total=None,
+            matched_count=0,
+            failures=[],
+            contract_error=(
+                f"В файле договора '{contract_file_name}' не найдена ни колонка 'Инв. №', "
+                "ни колонка 'Идентификационный номер (VIN)' / 'Заводской №'. "
+                "Обработка этого договора невозможна."
+            ),
+        )
+
+    try:
+        statement_rows = _load_generic_rows(statement_file)
+    except Exception as exc:
+        return ContractMatchResult(
+            contract_number=contract_number,
+            total=None,
+            matched_count=0,
+            failures=[],
+            contract_error=f"Не удалось прочитать файл Ведомости '{statement_file_name}': {exc}",
+        )
+
+    ved_info = _find_vedomost_columns(statement_rows)
+    if ved_info is None:
+        return ContractMatchResult(
+            contract_number=contract_number,
+            total=None,
+            matched_count=0,
+            failures=[],
+            contract_error=(
+                f"В файле Ведомости '{statement_file_name}' не найдена колонка "
+                "'Начисление амортизации (износа)'. Обработка этого договора невозможна."
+            ),
+        )
+    ved_header_row, ved_charge_column, ved_inventory_column = ved_info
+
+    if id_info.rule == "inventory" and ved_inventory_column is None:
+        return ContractMatchResult(
+            contract_number=contract_number,
+            total=None,
+            matched_count=0,
+            failures=[],
+            contract_error=(
+                f"В договоре '{contract_file_name}' используется колонка 'Инв. №', но в файле "
+                f"Ведомости '{statement_file_name}' нет колонки 'Инвентарный номер'. "
+                "Обработка этого договора невозможна."
+            ),
+        )
+
+    header_row = id_info.row
+    name_column: int | None = None
+    for column_index, value in enumerate(contract_rows[header_row]):
+        if _match_name_header(_normalize_text(value)):
+            name_column = column_index
+            break
+
+    total = 0.0
+    matched_count = 0
+    failures: list[AssetFailure] = []
+
+    for row_index in range(header_row + 1, len(contract_rows)):
+        row = contract_rows[row_index]
+        if _row_is_total_marker(row):
+            break
+
+        first_text = next((_normalize_text(value) for value in row if _normalize_text(value)), "")
+        if not first_text:
+            continue
+
+        identifier_text = _normalize_text(row[id_info.column]) if id_info.column < len(row) else ""
+        asset_name = _normalize_text(row[name_column]) if name_column is not None and name_column < len(row) else ""
+        label = asset_name or f"строка {row_index + 1}"
+
+        if not identifier_text or identifier_text.casefold() in BLANK_IDENTIFIER_VALUES:
+            failures.append(AssetFailure(
+                contract_number=contract_number,
+                asset_label=label,
+                identifier_value=identifier_text or "(пусто)",
+                reason="значение идентификатора не указано (прочерк/пусто)",
+            ))
+            continue
+
+        used_fallback_search = False
+        if id_info.rule == "inventory":
+            row_matches = _match_by_inventory_number(identifier_text, statement_rows, ved_inventory_column, ved_header_row + 1)
+            if not row_matches:
+                # Not found in the dedicated "Инвентарный номер" column - fall back to
+                # searching the value across every column of the Ведомость.
+                row_matches = _match_by_substring(identifier_text, statement_rows, ved_header_row + 1)
+                used_fallback_search = True
+        else:
+            row_matches = _match_by_substring(identifier_text, statement_rows, ved_header_row + 1)
+
+        distinct_rows = sorted(set(row_matches))
+
+        if not distinct_rows:
+            reason = "не найдено соответствие в Ведомости Амортизации"
+            if used_fallback_search:
+                reason += " (искали и в колонке 'Инвентарный номер', и по всем колонкам)"
+            failures.append(AssetFailure(
+                contract_number=contract_number,
+                asset_label=label,
+                identifier_value=identifier_text,
+                reason=reason,
+            ))
+            continue
+
+        if len(distinct_rows) > 1:
+            reason = (
+                "найдено несколько разных строк в Ведомости "
+                f"(строки {', '.join(str(index + 1) for index in distinct_rows)}) - "
+                "невозможно однозначно определить актив"
+            )
+            if used_fallback_search:
+                reason += " (найдено при поиске по всем колонкам после того, как значение не нашлось в 'Инвентарный номер')"
+            failures.append(AssetFailure(
+                contract_number=contract_number,
+                asset_label=label,
+                identifier_value=identifier_text,
+                reason=reason,
+            ))
+            continue
+
+        matched_row = statement_rows[distinct_rows[0]]
+        charge_value = matched_row[ved_charge_column] if ved_charge_column < len(matched_row) else None
+        charge_number = _coerce_number(charge_value)
+        if charge_number is None:
+            charge_number = 0.0
+
+        total += charge_number
+        matched_count += 1
+
+    if matched_count == 0 and not failures:
+        return ContractMatchResult(
+            contract_number=contract_number,
+            total=None,
+            matched_count=0,
+            failures=[],
+            contract_error=f"В реестре договора '{contract_file_name}' не найдено ни одной строки с активами.",
+        )
+
+    return ContractMatchResult(
+        contract_number=contract_number,
+        total=total if matched_count > 0 else None,
+        matched_count=matched_count,
+        failures=failures,
+        contract_error=None,
+    )
 
 
 def _build_period_grid(periods: Iterable[Period]) -> list[Period]:
@@ -452,15 +831,33 @@ def generate_depreciation_workbook(
 
     period_already_existed = period in table.periods
     contract_messages: list[str] = []
+    contract_errors: list[str] = []
+    asset_failures: list[AssetFailure] = []
+
     for contract in contracts:
-        value = find_contract_depreciation_total(contract.contract_file, statement_file, period)
-        result = apply_contract_period_value(table, contract.contract_number, period, value)
-        if result.contract_created:
-            contract_messages.append(f"Договор '{contract.contract_number}': добавлена новая строка в таблице.")
-        elif result.value_written:
-            contract_messages.append(f"Договор '{contract.contract_number}': записано новое значение.")
+        match_result = match_contract_depreciation(contract.contract_number, contract.contract_file, statement_file)
+        asset_failures.extend(match_result.failures)
+        if match_result.contract_error:
+            contract_errors.append(f"Договор '{contract.contract_number}' ({Path(contract.contract_file).name}): {match_result.contract_error}")
+
+        apply_result = apply_contract_period_value(table, contract.contract_number, period, match_result.total)
+
+        if apply_result.contract_created:
+            row_note = "добавлена новая строка в таблице"
+        elif apply_result.value_written:
+            row_note = "записано новое значение"
         else:
-            contract_messages.append(f"Договор '{contract.contract_number}': строка уже существовала, значение не изменено.")
+            row_note = "строка уже существовала, значение не изменено"
+
+        if match_result.total is not None:
+            detail = f"учтено активов: {match_result.matched_count}"
+            if match_result.failures:
+                detail += f", не сопоставлено: {len(match_result.failures)}"
+            contract_messages.append(f"Договор '{contract.contract_number}': {row_note} ({detail}).")
+        elif match_result.contract_error:
+            contract_messages.append(f"Договор '{contract.contract_number}': {row_note}, значение не рассчитано — см. список проблем.")
+        else:
+            contract_messages.append(f"Договор '{contract.contract_number}': {row_note}, ни один актив не сопоставлен — см. список проблем.")
 
     if period_already_existed:
         messages.append(f"Месяц {period.month_name} {period.year} уже существовал в таблице — новый столбец не добавлялся.")
@@ -472,7 +869,13 @@ def generate_depreciation_workbook(
     _render_into_sheet(sheet, table)
     workbook.active = workbook.sheetnames.index(sheet.title)
 
-    return GenerationResult(workbook=workbook, sheet_name=sheet.title, messages=messages)
+    return GenerationResult(
+        workbook=workbook,
+        sheet_name=sheet.title,
+        messages=messages,
+        contract_errors=contract_errors,
+        asset_failures=asset_failures,
+    )
 
 
 def save_depreciation_workbook(result: GenerationResult, output_path: str | Path) -> None:
