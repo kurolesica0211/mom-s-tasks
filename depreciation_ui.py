@@ -6,7 +6,7 @@ from pathlib import Path
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
-from arenda_table import TaxRateRule, build_arenda_workbook, save_arenda_workbook
+from arenda_table import build_arenda_workbook, save_arenda_workbook
 from depreciation_table import (
     MONTH_NAMES,
     MONTH_TO_INDEX,
@@ -17,6 +17,7 @@ from depreciation_table import (
     list_table_names,
     save_depreciation_workbook,
 )
+from tax_rules import TaxRateRule
 
 
 @dataclass
@@ -80,6 +81,7 @@ class ArendaUI:
 
         self._bind_edit_shortcuts()
         self._build_header()
+        self._build_tax_rules_window()
         self._build_task_container()
 
     def _bind_edit_shortcuts(self) -> None:
@@ -120,6 +122,50 @@ class ArendaUI:
         )
         task_combo.grid(row=0, column=1, sticky="ew")
         task_combo.bind("<<ComboboxSelected>>", self._on_task_changed)
+
+        ttk.Button(task_row, text="Налоговые множители", command=self._open_tax_rules_window).grid(
+            row=0, column=2, sticky="e", padx=(8, 0)
+        )
+
+    def _build_tax_rules_window(self) -> None:
+        self.tax_rules_window = tk.Toplevel(self.root)
+        self.tax_rules_window.title("Налоговые множители")
+        self.tax_rules_window.geometry("420x420")
+        self.tax_rules_window.protocol("WM_DELETE_WINDOW", self.tax_rules_window.withdraw)
+        self.tax_rules_window.withdraw()
+
+        container = ttk.Frame(self.tax_rules_window, padding=12)
+        container.grid(row=0, column=0, sticky="nsew")
+        self.tax_rules_window.rowconfigure(0, weight=1)
+        self.tax_rules_window.columnconfigure(0, weight=1)
+        container.columnconfigure(0, weight=1)
+
+        ttk.Label(
+            container,
+            text=(
+                "Эти множители применяются всеми задачами при расчёте значений после "
+                "налогов (столбец «очищенная» и т.п.). Правило действует с указанного "
+                "года и далее, до следующего правила."
+            ),
+            wraplength=380,
+            justify="left",
+        ).grid(row=0, column=0, sticky="ew")
+
+        self.tax_rules_frame = ttk.Frame(container)
+        self.tax_rules_frame.grid(row=1, column=0, sticky="ew", pady=(10, 0))
+        self.tax_rules_frame.columnconfigure(0, weight=1)
+
+        actions = ttk.Frame(container)
+        actions.grid(row=2, column=0, sticky="ew", pady=(10, 0))
+        ttk.Button(actions, text="Добавить правило", command=self._add_tax_rule).pack(side="left")
+        ttk.Button(actions, text="Закрыть", command=self.tax_rules_window.withdraw).pack(side="right")
+
+        self._add_tax_rule("0", "0.8")
+        self._add_tax_rule("2025", "0.75")
+
+    def _open_tax_rules_window(self) -> None:
+        self.tax_rules_window.deiconify()
+        self.tax_rules_window.lift()
 
     def _build_task_container(self) -> None:
         self.task_canvas = tk.Canvas(self.main, borderwidth=0, highlightthickness=0)
@@ -235,17 +281,11 @@ class ArendaUI:
         self.root.bind_all("<Button-4>", self._on_lessor_mousewheel_linux, add="+")
         self.root.bind_all("<Button-5>", self._on_lessor_mousewheel_linux, add="+")
 
-        taxes_box = ttk.LabelFrame(parent, text="Налоговые множители", padding=10)
-        taxes_box.grid(row=2, column=0, sticky="ew", pady=(12, 0))
-        taxes_box.columnconfigure(0, weight=1)
-
-        ttk.Label(taxes_box, text="Правила применяются по году: с указанного года и далее.").grid(row=0, column=0, sticky="w")
-
-        self.tax_rules_frame = ttk.Frame(taxes_box)
-        self.tax_rules_frame.grid(row=1, column=0, sticky="ew", pady=(6, 0))
-        self.tax_rules_frame.columnconfigure(0, weight=1)
-
-        ttk.Button(taxes_box, text="Добавить правило", command=self._add_tax_rule).grid(row=2, column=0, sticky="w", pady=(8, 0))
+        ttk.Label(
+            parent,
+            text="Налоговые множители теперь общие для всех задач — кнопка «Налоговые множители» вверху окна.",
+            foreground="#4a4a4a",
+        ).grid(row=2, column=0, sticky="w", pady=(12, 0))
 
         actions = ttk.Frame(parent)
         actions.grid(row=3, column=0, sticky="ew", pady=(16, 0))
@@ -253,8 +293,6 @@ class ArendaUI:
 
         ttk.Button(actions, text="Сформировать файл Аренда", command=self._generate_arenda).grid(row=0, column=1, sticky="e")
 
-        self._add_tax_rule("0", "0.8")
-        self._add_tax_rule("2025", "0.75")
         self._add_lessor()
 
     def _on_task_changed(self, _event: tk.Event | None = None) -> None:
@@ -786,6 +824,7 @@ class ArendaUI:
                 raise ValueError("Выберите файл 'Ведомость Амортизации'.")
 
             contracts = self._collect_contracts()
+            tax_rules = self._parse_tax_rules()
 
             mode = self.source_mode_var.get()
             source_table_path: Path | None = None
@@ -818,6 +857,7 @@ class ArendaUI:
                 source_table_path=source_table_path,
                 source_table_name=source_table_name,
                 new_table_name=new_table_name,
+                tax_rules=tax_rules,
             )
 
             output_path = filedialog.asksaveasfilename(

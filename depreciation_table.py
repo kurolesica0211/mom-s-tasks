@@ -6,9 +6,12 @@ from pathlib import Path
 from typing import Iterable, Sequence
 
 import openpyxl
+from openpyxl.cell.cell import Cell
 from openpyxl.styles import Border, Font, Side
 from openpyxl.utils import get_column_letter
 from openpyxl.worksheet.worksheet import Worksheet
+
+from tax_rules import DEFAULT_TAX_RULES, TaxRateRule, tax_multiplier_for_year
 
 try:
     import xlrd
@@ -32,31 +35,6 @@ CLEANED_LABEL = "очищенная"
 CURRENCY_FORMAT = '_-* #,##0.00\\ _₽_-;\\-* #,##0.00\\ _₽_-;_-* "-"??\\ _₽_-;_-@_-'
 
 _INVALID_SHEET_CHARS = set(":\\/?*[]")
-
-
-@dataclass(frozen=True)
-class TaxRateRule:
-    from_year: int
-    multiplier: float
-
-
-# Tax multipliers are hardcoded here for now; a shared tax-rules tab covering
-# every task (including Аренда) is planned, at which point this table will
-# stop owning its own copy.
-DEFAULT_TAX_RULES: tuple[TaxRateRule, ...] = (
-    TaxRateRule(from_year=0, multiplier=0.8),
-    TaxRateRule(from_year=2025, multiplier=0.75),
-)
-
-
-def _tax_multiplier_for_year(year: int, tax_rules: Sequence[TaxRateRule] = DEFAULT_TAX_RULES) -> float:
-    selected: float | None = None
-    for rule in sorted(tax_rules, key=lambda item: item.from_year):
-        if year >= rule.from_year:
-            selected = rule.multiplier
-    if selected is None:
-        raise ValueError("tax_rules must contain a rule with from_year <= the requested year")
-    return selected
 
 
 def _normalize_text(value: object) -> str:
@@ -651,6 +629,51 @@ def _apply_row_font(sheet: Worksheet, row: int, min_col: int, max_col: int, *, b
         sheet.cell(row=row, column=column).font = Font(bold=bold)
 
 
+def _wide_merge_anchors(sheet: Worksheet) -> set[tuple[int, int]]:
+    """(row, column) of every merge that spans more than one column, so its text isn't mistaken for that column's own content."""
+    return {
+        (merged_range.min_row, merged_range.min_col)
+        for merged_range in sheet.merged_cells.ranges
+        if merged_range.max_col > merged_range.min_col
+    }
+
+
+def _cell_text_width(cell: Cell) -> int:
+    value = cell.value
+    if value is None:
+        return 0
+    if isinstance(value, str) and value.startswith("="):
+        return 0  # formula cells are sized via extra_widths instead, using the real computed value
+    if isinstance(value, (int, float)) and cell.number_format == CURRENCY_FORMAT:
+        return len(f"{value:,.2f} ₽")
+    return len(str(value))
+
+
+def _autosize_columns(
+    sheet: Worksheet,
+    *,
+    min_column: int,
+    max_column: int,
+    extra_widths: dict[int, float] | None = None,
+    min_width: int = 8,
+    max_width: int = 60,
+    padding: int = 2,
+) -> None:
+    extra_widths = extra_widths or {}
+    skip = _wide_merge_anchors(sheet)
+    for column in range(min_column, max_column + 1):
+        max_len = 0
+        for row in range(1, sheet.max_row + 1):
+            if (row, column) in skip:
+                continue
+            max_len = max(max_len, _cell_text_width(sheet.cell(row=row, column=column)))
+        extra = extra_widths.get(column)
+        if extra is not None:
+            max_len = max(max_len, len(f"{extra:,.2f} ₽"))
+        width = min(max(max_len + padding, min_width), max_width)
+        sheet.column_dimensions[get_column_letter(column)].width = width
+
+
 def _write_month_headers(sheet: Worksheet, period_grid: Sequence[Period]) -> dict[Period, int]:
     month_groups: list[tuple[str, list[Period]]] = []
     for period in period_grid:
@@ -696,7 +719,7 @@ def _write_total_headers(sheet: Worksheet, year_to_column: dict[int, int]) -> No
         sheet.cell(row=4, column=column).value = year
 
 
-def _render_into_sheet(sheet: Worksheet, table: DepreciationTable) -> None:
+def _render_into_sheet(sheet: Worksheet, table: DepreciationTable, tax_rules: Sequence[TaxRateRule]) -> None:
     if not table.contracts:
         raise ValueError("В таблице нет ни одного договора.")
 
@@ -722,10 +745,9 @@ def _render_into_sheet(sheet: Worksheet, table: DepreciationTable) -> None:
     sheet["B2"] = table.contracts_label
     sheet["C2"] = PROPERTY_LABEL
 
-    sheet.column_dimensions["A"].width = 16
-    sheet.column_dimensions["B"].width = 22
-    for column in range(3, last_column + 1):
-        sheet.column_dimensions[get_column_letter(column)].width = 12
+    column_extra: dict[int, float] = {}
+    period_totals: dict[Period, float] = {period: 0.0 for period in period_to_column}
+    year_totals: dict[int, float] = {year: 0.0 for year in year_to_column}
 
     row = 6
     contract_start = row
@@ -738,15 +760,19 @@ def _render_into_sheet(sheet: Worksheet, table: DepreciationTable) -> None:
                 cell = sheet.cell(row=row, column=column)
                 cell.value = value
                 cell.number_format = CURRENCY_FORMAT
+                period_totals[period] += value
 
         for year, year_column in year_to_column.items():
             month_columns = [period_to_column[period] for period in period_grid if period.year == year]
             if not month_columns:
                 continue
             terms = "+".join(f"{get_column_letter(column)}{row}" for column in month_columns)
+            year_value = sum(contract.values.get(period) or 0 for period in period_grid if period.year == year)
             cell = sheet.cell(row=row, column=year_column)
             cell.value = f"={terms}"
             cell.number_format = CURRENCY_FORMAT
+            column_extra[year_column] = max(column_extra.get(year_column, 0.0), abs(year_value))
+            year_totals[year] += year_value
 
         _apply_row_border(sheet, row, 1, last_column)
         row += 1
@@ -763,10 +789,13 @@ def _render_into_sheet(sheet: Worksheet, table: DepreciationTable) -> None:
         total_cell.value = f"=SUM({column_letter}{contract_start}:{column_letter}{contract_end})"
         total_cell.number_format = CURRENCY_FORMAT
 
-        multiplier = _tax_multiplier_for_year(period.year)
+        multiplier = tax_multiplier_for_year(period.year, tax_rules)
         cleaned_cell = sheet.cell(row=cleaned_row, column=column)
         cleaned_cell.value = f"={column_letter}{total_row}*{multiplier}"
         cleaned_cell.number_format = CURRENCY_FORMAT
+
+        period_total = period_totals[period]
+        column_extra[column] = max(column_extra.get(column, 0.0), abs(period_total), abs(period_total * multiplier))
 
     for year, column in year_to_column.items():
         column_letter = get_column_letter(column)
@@ -774,15 +803,20 @@ def _render_into_sheet(sheet: Worksheet, table: DepreciationTable) -> None:
         total_cell.value = f"=SUM({column_letter}{contract_start}:{column_letter}{contract_end})"
         total_cell.number_format = CURRENCY_FORMAT
 
-        multiplier = _tax_multiplier_for_year(year)
+        multiplier = tax_multiplier_for_year(year, tax_rules)
         cleaned_cell = sheet.cell(row=cleaned_row, column=column)
         cleaned_cell.value = f"={column_letter}{total_row}*{multiplier}"
         cleaned_cell.number_format = CURRENCY_FORMAT
+
+        year_total = year_totals[year]
+        column_extra[column] = max(column_extra.get(column, 0.0), abs(year_total), abs(year_total * multiplier))
 
     _apply_row_font(sheet, total_row, 1, last_column, bold=True)
     _apply_row_font(sheet, cleaned_row, 1, last_column, bold=True)
     _apply_row_border(sheet, total_row, 1, last_column, top="medium")
     _apply_row_border(sheet, cleaned_row, 1, last_column, bottom="medium")
+
+    _autosize_columns(sheet, min_column=1, max_column=last_column, extra_widths=column_extra)
 
 
 def _replace_or_create_sheet(workbook: openpyxl.Workbook, sheet_name: str) -> Worksheet:
@@ -802,9 +836,13 @@ def generate_depreciation_workbook(
     source_table_path: str | Path | None = None,
     source_table_name: str | None = None,
     new_table_name: str | None = None,
+    tax_rules: Sequence[TaxRateRule] | None = None,
 ) -> GenerationResult:
     if not contracts:
         raise ValueError("Добавьте хотя бы один договор аренды.")
+
+    if tax_rules is None:
+        tax_rules = DEFAULT_TAX_RULES
 
     if source_table_path is not None:
         workbook = openpyxl.load_workbook(source_table_path, data_only=False)
@@ -866,7 +904,7 @@ def generate_depreciation_workbook(
     messages.extend(contract_messages)
 
     sheet = _replace_or_create_sheet(workbook, target_sheet_name)
-    _render_into_sheet(sheet, table)
+    _render_into_sheet(sheet, table, tax_rules)
     workbook.active = workbook.sheetnames.index(sheet.title)
 
     return GenerationResult(

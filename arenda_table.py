@@ -7,16 +7,20 @@ from pathlib import Path
 from typing import Mapping, Sequence
 
 import openpyxl
-from openpyxl.cell.cell import MergedCell
+from openpyxl.cell.cell import Cell, MergedCell
 from openpyxl.styles import Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
 from openpyxl.worksheet.worksheet import Worksheet
+
+from tax_rules import DEFAULT_TAX_RULES, TaxRateRule, tax_multiplier_for_year
 
 try:
 	import xlrd
 except ImportError:  # pragma: no cover - .xls support is optional at import time
 	xlrd = None
 
+
+CURRENCY_FORMAT = '_-* #,##0.00\\ _₽_-;\\-* #,##0.00\\ _₽_-;_-* "-"??\\ _₽_-;_-@_-'
 
 MONTH_TO_INDEX = {
 	"январь": 1,
@@ -61,12 +65,6 @@ class LessorSection:
 class ArendaTable:
 	periods: list[PeriodKey]
 	sections: list[LessorSection]
-
-
-@dataclass(frozen=True)
-class TaxRateRule:
-	from_year: int
-	multiplier: float
 
 
 def _normalize_text(value: object) -> str:
@@ -280,16 +278,6 @@ def _build_period_grid(periods: Sequence[PeriodKey]) -> list[PeriodKey]:
 	return period_grid
 
 
-def _tax_multiplier_for_year(year: int, tax_rules: Sequence[TaxRateRule]) -> float:
-	selected_multiplier = None
-	for tax_rule in sorted(tax_rules, key=lambda item: item.from_year):
-		if year >= tax_rule.from_year:
-			selected_multiplier = tax_rule.multiplier
-
-	if selected_multiplier is None:
-		raise ValueError("tax_rules must contain at least one rule with from_year <= the requested year")
-
-	return float(selected_multiplier)
 
 
 def _clear_working_area(sheet: Worksheet) -> None:
@@ -447,7 +435,52 @@ def _apply_number_format(sheet: Worksheet, row_number: int, start_column: int, e
 
 
 def _format_period_row(sheet: Worksheet, row_number: int, last_column: int) -> None:
-	_apply_number_format(sheet, row_number, 3, last_column, '#.##0,00')
+	_apply_number_format(sheet, row_number, 3, last_column, CURRENCY_FORMAT)
+
+
+def _wide_merge_anchors(sheet: Worksheet) -> set[tuple[int, int]]:
+	"""(row, column) of every merge that spans more than one column, so its text isn't mistaken for that column's own content."""
+	return {
+		(merged_range.min_row, merged_range.min_col)
+		for merged_range in sheet.merged_cells.ranges
+		if merged_range.max_col > merged_range.min_col
+	}
+
+
+def _cell_text_width(cell: Cell) -> int:
+	value = cell.value
+	if value is None:
+		return 0
+	if isinstance(value, str) and value.startswith("="):
+		return 0  # formula cells are sized via extra_widths instead, using the real computed value
+	if isinstance(value, (int, float)) and cell.number_format == CURRENCY_FORMAT:
+		return len(f"{value:,.2f} ₽")
+	return len(str(value))
+
+
+def _autosize_columns(
+	sheet: Worksheet,
+	*,
+	min_column: int,
+	max_column: int,
+	extra_widths: dict[int, float] | None = None,
+	min_width: int = 8,
+	max_width: int = 60,
+	padding: int = 2,
+) -> None:
+	extra_widths = extra_widths or {}
+	skip = _wide_merge_anchors(sheet)
+	for column in range(min_column, max_column + 1):
+		max_len = 0
+		for row in range(1, sheet.max_row + 1):
+			if (row, column) in skip:
+				continue
+			max_len = max(max_len, _cell_text_width(sheet.cell(row=row, column=column)))
+		extra = extra_widths.get(column)
+		if extra is not None:
+			max_len = max(max_len, len(f"{extra:,.2f} ₽"))
+		width = min(max(max_len + padding, min_width), max_width)
+		sheet.column_dimensions[get_column_letter(column)].width = width
 
 
 def build_arenda_workbook(
@@ -456,10 +489,7 @@ def build_arenda_workbook(
 	tax_rules: Sequence[TaxRateRule] | None = None,
 ) -> openpyxl.Workbook:
 	if tax_rules is None:
-		tax_rules = (
-			TaxRateRule(from_year=0, multiplier=0.8),
-			TaxRateRule(from_year=2025, multiplier=0.75),
-		)
+		tax_rules = DEFAULT_TAX_RULES
 
 	table = collect_arenda_table(lessor_groups, lessee_company_name)
 	period_grid = _build_period_grid(table.periods)
@@ -467,10 +497,14 @@ def build_arenda_workbook(
 	year_to_column, year_last_column = _build_year_columns(period_grid, max(period_to_column.values(), default=3) + 1)
 	_write_year_headers(sheet, year_to_column)
 
+	last_column = max(year_last_column, max(period_to_column.values(), default=3))
+
 	row_number = 7
 	section_period_has_values: list[dict[PeriodKey, bool]] = []
 	section_year_totals: list[dict[int, float | None]] = []
 	section_spans: list[tuple[int, int]] = []
+	column_extra: dict[int, float] = {}
+	grand_period_totals = {period_key: 0.0 for period_key in period_to_column}
 
 	for section in table.sections:
 		sheet.cell(row=row_number, column=1).value = section.lessor_name
@@ -478,6 +512,7 @@ def build_arenda_workbook(
 		contract_start = row_number + 1
 		contract_end = row_number
 		period_has_values = {period_key: False for period_key in period_to_column}
+		section_period_totals = {period_key: 0.0 for period_key in period_to_column}
 		section_year_values = {year: 0.0 for year in year_to_column}
 		section_year_has_values = {year: False for year in year_to_column}
 
@@ -492,6 +527,7 @@ def build_arenda_workbook(
 				period_column = period_to_column[period_key]
 				sheet.cell(row=contract_end, column=period_column).value = value
 				period_has_values[period_key] = True
+				section_period_totals[period_key] += float(value)
 				contract_year_values[period_key.year] += float(value)
 				contract_year_has_values[period_key.year] = True
 				section_year_values[period_key.year] += float(value)
@@ -501,7 +537,7 @@ def build_arenda_workbook(
 				sheet.cell(row=contract_end, column=year_column).value = contract_year_values[year] if contract_year_has_values[year] else None
 
 			_format_period_row(sheet, contract_end, max(period_to_column.values(), default=2))
-			_apply_number_format(sheet, contract_end, min(year_to_column.values(), default=0), year_last_column, '#.##0,00')
+			_apply_number_format(sheet, contract_end, min(year_to_column.values(), default=0), year_last_column, CURRENCY_FORMAT)
 
 		section_spans.append((contract_start, contract_end) if section.contract_rows else (0, 0))
 		total_row = contract_end + 1
@@ -513,22 +549,31 @@ def build_arenda_workbook(
 			if period_has_values[period_key]:
 				start_letter = get_column_letter(period_column)
 				sheet.cell(row=total_row, column=period_column).value = f"=SUM({start_letter}{contract_start}:{start_letter}{contract_end})"
-				sheet.cell(row=cleaned_row, column=period_column).value = f"={get_column_letter(period_column)}{total_row}*{_tax_multiplier_for_year(period_key.year, tax_rules)}"
+				multiplier = tax_multiplier_for_year(period_key.year, tax_rules)
+				sheet.cell(row=cleaned_row, column=period_column).value = f"={get_column_letter(period_column)}{total_row}*{multiplier}"
+				period_total = section_period_totals[period_key]
+				column_extra[period_column] = max(column_extra.get(period_column, 0.0), abs(period_total), abs(period_total * multiplier))
 			else:
 				sheet.cell(row=total_row, column=period_column).value = None
 				sheet.cell(row=cleaned_row, column=period_column).value = None
+			grand_period_totals[period_key] += section_period_totals[period_key]
 
 		for year, year_column in year_to_column.items():
 			year_total = section_year_values[year] if section_year_has_values[year] else None
 			sheet.cell(row=total_row, column=year_column).value = year_total
-			sheet.cell(row=cleaned_row, column=year_column).value = f"={get_column_letter(year_column)}{total_row}*{_tax_multiplier_for_year(year, tax_rules)}" if year_total is not None else None
+			if year_total is not None:
+				multiplier = tax_multiplier_for_year(year, tax_rules)
+				sheet.cell(row=cleaned_row, column=year_column).value = f"={get_column_letter(year_column)}{total_row}*{multiplier}"
+				column_extra[year_column] = max(column_extra.get(year_column, 0.0), abs(year_total * multiplier))
+			else:
+				sheet.cell(row=cleaned_row, column=year_column).value = None
 
 		_apply_row_font(sheet, total_row, 1, year_last_column, bold=True)
 		_apply_row_font(sheet, cleaned_row, 1, year_last_column, bold=True)
 		_apply_row_border(sheet, total_row, 1, year_last_column, top="thick")
 		_apply_row_border(sheet, cleaned_row, 1, year_last_column, bottom="thick")
-		_apply_number_format(sheet, total_row, 3, year_last_column, '#.##0,00')
-		_apply_number_format(sheet, cleaned_row, 3, year_last_column, '#.##0,00')
+		_apply_number_format(sheet, total_row, 3, year_last_column, CURRENCY_FORMAT)
+		_apply_number_format(sheet, cleaned_row, 3, year_last_column, CURRENCY_FORMAT)
 
 		section_period_has_values.append(period_has_values)
 		section_year_totals.append({year: (section_year_values[year] if section_year_has_values[year] else None) for year in year_to_column})
@@ -550,7 +595,10 @@ def build_arenda_workbook(
 			if any(period_has_values.get(period_key) for period_has_values in section_period_has_values):
 				ranges = [f"{period_letter}{start}:{period_letter}{end}" for start, end in section_spans if start and end]
 				sheet.cell(row=grand_total_row, column=period_column).value = f"=SUM({','.join(ranges)})"
-				sheet.cell(row=grand_cleaned_row, column=period_column).value = f"={period_letter}{grand_total_row}*{_tax_multiplier_for_year(period_key.year, tax_rules)}"
+				multiplier = tax_multiplier_for_year(period_key.year, tax_rules)
+				sheet.cell(row=grand_cleaned_row, column=period_column).value = f"={period_letter}{grand_total_row}*{multiplier}"
+				grand_total = grand_period_totals[period_key]
+				column_extra[period_column] = max(column_extra.get(period_column, 0.0), abs(grand_total), abs(grand_total * multiplier))
 			else:
 				sheet.cell(row=grand_total_row, column=period_column).value = None
 				sheet.cell(row=grand_cleaned_row, column=period_column).value = None
@@ -559,12 +607,19 @@ def build_arenda_workbook(
 			grand_year_values = [section_year_total[year] for section_year_total in section_year_totals if section_year_total.get(year) is not None]
 			grand_year_total = float(sum(grand_year_values)) if grand_year_values else None
 			sheet.cell(row=grand_total_row, column=year_column).value = grand_year_total
-			sheet.cell(row=grand_cleaned_row, column=year_column).value = f"={get_column_letter(year_column)}{grand_total_row}*{_tax_multiplier_for_year(year, tax_rules)}" if grand_year_total is not None else None
+			if grand_year_total is not None:
+				multiplier = tax_multiplier_for_year(year, tax_rules)
+				sheet.cell(row=grand_cleaned_row, column=year_column).value = f"={get_column_letter(year_column)}{grand_total_row}*{multiplier}"
+				column_extra[year_column] = max(column_extra.get(year_column, 0.0), abs(grand_year_total * multiplier))
+			else:
+				sheet.cell(row=grand_cleaned_row, column=year_column).value = None
 
 		_apply_row_border(sheet, grand_total_row, 1, year_last_column, top="thick")
 		_apply_row_border(sheet, grand_cleaned_row, 1, year_last_column, bottom="thick")
-		_apply_number_format(sheet, grand_total_row, 3, year_last_column, '#.##0,00')
-		_apply_number_format(sheet, grand_cleaned_row, 3, year_last_column, '#.##0,00')
+		_apply_number_format(sheet, grand_total_row, 3, year_last_column, CURRENCY_FORMAT)
+		_apply_number_format(sheet, grand_cleaned_row, 3, year_last_column, CURRENCY_FORMAT)
+
+	_autosize_columns(sheet, min_column=1, max_column=last_column, extra_widths=column_extra)
 
 	return workbook
 
@@ -579,10 +634,7 @@ if __name__ == "__main__":
 	# Edit these settings before running the script.
 	lessee_company_name = "НСС ООО"
 	# Add more rules later by appending more TaxRateRule entries.
-	tax_rules = (
-		TaxRateRule(from_year=0, multiplier=0.8),
-		TaxRateRule(from_year=2025, multiplier=0.75),
-	)
+	tax_rules = DEFAULT_TAX_RULES
 	output_path = workspace_root / "Амортизация НСС 2026_аренда.xlsx"
 
 	lessor_groups = {
